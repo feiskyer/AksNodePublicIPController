@@ -36,6 +36,8 @@ spec:
       labels:
         run: aksnodepublicipcontroller
     spec:
+      nodeSelector:
+        beta.kubernetes.io/os: linux
       serviceAccountName: aksnodepublicipcontroller-sa
       tolerations:
       - effect: NoSchedule
