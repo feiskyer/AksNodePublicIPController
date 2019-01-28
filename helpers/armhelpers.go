@@ -3,13 +3,27 @@ package helpers
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strings"
 
-	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2017-03-30/compute"
+	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2018-10-01/compute"
 	"github.com/Azure/azure-sdk-for-go/services/network/mgmt/2017-09-01/network"
 	"github.com/Azure/go-autorest/autorest/to"
 	log "github.com/Sirupsen/logrus"
 )
+
+var (
+	scaleSetNameRE = regexp.MustCompile(`.*/subscriptions/(?:.*)/Microsoft.Compute/virtualMachineScaleSets/(.+)/virtualMachines(?:.*)`)
+)
+
+func extractScaleSetNameByProviderID(providerID string) (string, error) {
+	matches := scaleSetNameRE.FindStringSubmatch(providerID)
+	if len(matches) != 2 {
+		return "", fmt.Errorf("not a vmss instance")
+	}
+
+	return matches[1], nil
+}
 
 func getIPClient() network.PublicIPAddressesClient {
 	ipClient := network.NewPublicIPAddressesClient(spDetails.SubscriptionID)
@@ -30,6 +44,13 @@ func getNicClient() network.InterfacesClient {
 	auth, _ := GetResourceManagementAuthorizer()
 	nicClient.Authorizer = auth
 	return nicClient
+}
+
+func getVmssClient() compute.VirtualMachineScaleSetsClient {
+	vmssClient := compute.NewVirtualMachineScaleSetsClient(spDetails.SubscriptionID)
+	auth, _ := GetResourceManagementAuthorizer()
+	vmssClient.Authorizer = auth
+	return vmssClient
 }
 
 func createPublicIP(ctx context.Context, ipName string) (ip network.PublicIPAddress, err error) {
@@ -83,16 +104,23 @@ func getNetworkInterface(ctx context.Context, vmName string) (*network.Interface
 }
 
 type IPUpdater interface {
-	CreateOrUpdateVMPulicIP(ctx context.Context, vmName string, ipName string) error
+	CreateOrUpdateVMPulicIP(ctx context.Context, vmName, providerID string, ipName string) error
 	DeletePublicIP(ctx context.Context, ipName string) error
-	DisassociatePublicIPForNode(ctx context.Context, nodeName string) error
+	DisassociatePublicIPForNode(ctx context.Context, nodeName, providerID string) error
+	UpdateVMSSPublicIP(ctx context.Context, scaleSet string) error
 }
+
 type IPUpdate struct{}
 
 // CreateOrUpdateVMPulicIP will create a new Public IP and assign it to the Virtual Machine
-func (*IPUpdate) CreateOrUpdateVMPulicIP(ctx context.Context, vmName string, ipName string) error {
+func (u *IPUpdate) CreateOrUpdateVMPulicIP(ctx context.Context, vmName, providerID string, ipName string) error {
+	log.Infof("Trying to get NIC from the node %q", vmName)
 
-	log.Infof("Trying to get NIC from the VM %s", vmName)
+	scaleSet, err := extractScaleSetNameByProviderID(providerID)
+	if err == nil {
+		log.Infof("Trying to setup public IP per instance for scale set %q", scaleSet)
+		return u.UpdateVMSSPublicIP(ctx, scaleSet)
+	}
 
 	nic, err := getNetworkInterface(ctx, vmName)
 	if err != nil {
@@ -150,7 +178,13 @@ func (*IPUpdate) DeletePublicIP(ctx context.Context, ipName string) error {
 }
 
 // DisassociatePublicIPForNode will remove the Public IP address association from the VM's NIC
-func (*IPUpdate) DisassociatePublicIPForNode(ctx context.Context, nodeName string) error {
+func (*IPUpdate) DisassociatePublicIPForNode(ctx context.Context, nodeName, providerID string) error {
+	_, err := extractScaleSetNameByProviderID(providerID)
+	if err == nil {
+		log.Infof("Skipping public IP deallocating for node %q since it is managed by VMSS", nodeName)
+		return nil
+	}
+
 	ipClient := getIPClient()
 	ipAddress, err := ipClient.Get(ctx, spDetails.ResourceGroup, GetPublicIPName(nodeName), "")
 	if err != nil {
@@ -173,7 +207,6 @@ func (*IPUpdate) DisassociatePublicIPForNode(ctx context.Context, nodeName strin
 
 	// get the NIC
 	nic, err := nicClient.Get(ctx, spDetails.ResourceGroup, nicName, "")
-
 	if err != nil {
 		return fmt.Errorf("cannot get NIC for Node %s, error: %v", nodeName, err)
 	}
@@ -205,6 +238,53 @@ func (*IPUpdate) DisassociatePublicIPForNode(ctx context.Context, nodeName strin
 	err = futureDelete.WaitForCompletion(ctx, nicClient.Client)
 	if err != nil {
 		return fmt.Errorf("cannot get NIC Delete response for Node %s:, error: %v. NIC may have already been deleted", nodeName, err)
+	}
+
+	return nil
+}
+
+func (u *IPUpdate) UpdateVMSSPublicIP(ctx context.Context, scaleSet string) error {
+	vmssClient := getVmssClient()
+	vmss, err := vmssClient.Get(ctx, spDetails.ResourceGroup, scaleSet)
+	if err != nil {
+		return fmt.Errorf("failed to get vmss %q: %v", scaleSet, err)
+	}
+
+	// Setup public IP per virtual machine for VMSS.
+	if vmss.VirtualMachineProfile != nil && vmss.VirtualMachineProfile.NetworkProfile != nil &&
+		vmss.VirtualMachineProfile.NetworkProfile.NetworkInterfaceConfigurations != nil {
+		ifaces := *vmss.VirtualMachineProfile.NetworkProfile.NetworkInterfaceConfigurations
+		if len(ifaces) > 0 && ifaces[0].IPConfigurations != nil {
+			ips := *ifaces[0].IPConfigurations
+			ips[0].PublicIPAddressConfiguration = &compute.VirtualMachineScaleSetPublicIPAddressConfiguration{
+				Name: to.StringPtr(scaleSet + "_public_ip"),
+			}
+
+			// Update VMSS.
+			ifaces[0].IPConfigurations = &ips
+			vmss.VirtualMachineProfile.NetworkProfile.NetworkInterfaceConfigurations = &ifaces
+			future, err := vmssClient.CreateOrUpdate(ctx, spDetails.ResourceGroup, scaleSet, vmss)
+			if err != nil {
+				return fmt.Errorf("failed to CreateOrUpdate vmss %q: %v", scaleSet, err)
+			}
+			err = future.WaitForCompletionRef(ctx, vmssClient.Client)
+			if err != nil {
+				return fmt.Errorf("failed to update VMSS %q: %v", scaleSet, err)
+			}
+
+			// Update VMSS instances.
+			instanceIDs := []string{"*"}
+			instanceFuture, err := vmssClient.UpdateInstances(ctx, spDetails.ResourceGroup, scaleSet, compute.VirtualMachineScaleSetVMInstanceRequiredIDs{
+				InstanceIds: &instanceIDs,
+			})
+			if err != nil {
+				return fmt.Errorf("failed to update instances for vmss %q: %v", scaleSet, err)
+			}
+			err = instanceFuture.WaitForCompletionRef(ctx, vmssClient.Client)
+			if err != nil {
+				return fmt.Errorf("failed to update instances for vmss %q: %v", scaleSet, err)
+			}
+		}
 	}
 
 	return nil

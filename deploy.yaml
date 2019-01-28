@@ -45,7 +45,7 @@ spec:
         value: "true"
         key: node-role.kubernetes.io/master
       containers:
-      - image: docker.io/dgkanatsios/aksnodepublicipcontroller:0.2.8
+      - image: docker.io/feisky/aks-node-public-ip-controller:0.2.8
         name: aksnodepublicipcontroller
         volumeMounts:
           - name: akssp

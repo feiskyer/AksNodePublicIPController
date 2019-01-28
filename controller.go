@@ -212,7 +212,6 @@ func (c *NodeController) syncHandler(key string) error {
 	}
 
 	//Get the Node with this name
-
 	node, err := c.nodesLister.Get(name)
 
 	if err != nil {
@@ -220,7 +219,7 @@ func (c *NodeController) syncHandler(key string) error {
 		// processing.
 		if errors.IsNotFound(err) {
 			runtime.HandleError(fmt.Errorf("Node '%s' in work queue no longer exists in Node-Public IP controller", name))
-			errDelete := c.deletePublicIPForNode(name)
+			errDelete := c.deletePublicIPForNode(name, node.Spec.ProviderID)
 			if errDelete != nil {
 				log.Infof("Error deleting IP for Node %s: %v", name, errDelete.Error())
 				return errDelete
@@ -236,7 +235,7 @@ func (c *NodeController) syncHandler(key string) error {
 		//node does not have a Public IP
 		log.Infof("Node with name %s does not have a Public IP, trying to create one", node.Name)
 		retryErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-			err := c.ipUpdater.CreateOrUpdateVMPulicIP(ctx, node.Name, helpers.GetPublicIPName(node.Name))
+			err := c.ipUpdater.CreateOrUpdateVMPulicIP(ctx, node.Name, node.Spec.ProviderID, helpers.GetPublicIPName(node.Name))
 			if err != nil {
 				return err
 			}
@@ -248,8 +247,8 @@ func (c *NodeController) syncHandler(key string) error {
 			return nil
 		})
 		if retryErr != nil {
-			runtime.HandleError(fmt.Errorf("Error in creating IP %s, for Node %s", err.Error(), node.Name))
-			c.recorder.Event(node, corev1.EventTypeWarning, errorCreatingIP, err.Error())
+			runtime.HandleError(fmt.Errorf("Error in creating IP %s, for Node %s", retryErr.Error(), node.Name))
+			c.recorder.Event(node, corev1.EventTypeWarning, errorCreatingIP, retryErr.Error())
 			return nil
 		}
 		c.recorder.Event(node, corev1.EventTypeNormal, successCreatingIP, fmt.Sprintf("Successfully created IP for Node %s", node.Name))
@@ -296,7 +295,7 @@ func (c *NodeController) handleObject(obj interface{}) {
 	c.enqueueNode(object)
 }
 
-func (c *NodeController) deletePublicIPForNode(nodeName string) error {
+func (c *NodeController) deletePublicIPForNode(nodeName, providerID string) error {
 	log.Infof("Node with name %s has been deleted, trying to delete its Public IP", nodeName)
 	err := c.ipUpdater.DeletePublicIP(ctx, helpers.GetPublicIPName(nodeName))
 
@@ -305,7 +304,7 @@ func (c *NodeController) deletePublicIPForNode(nodeName string) error {
 	// Failure sending request: StatusCode=0 -- Original Error: autorest/azure: Service returned an error. Status=400 Code="PublicIPAddressCannotBeDeleted" Message="Public IP address /subscriptions/XXX/resourceGroups/XXX/providers/Microsoft.Network/publicIPAddresses/XXX can not be deleted since it is still allocated
 	if err != nil && strings.Contains(err.Error(), `Code="PublicIPAddressCannotBeDeleted"`) {
 		// try to disassociate the Public IP
-		errDis := c.ipUpdater.DisassociatePublicIPForNode(ctx, nodeName)
+		errDis := c.ipUpdater.DisassociatePublicIPForNode(ctx, nodeName, providerID)
 		if errDis != nil {
 			runtime.HandleError(fmt.Errorf("Cannot disassociate Public IP for node %s due to error %s", nodeName, errDis.Error()))
 		}
