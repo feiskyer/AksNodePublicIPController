@@ -28,8 +28,13 @@ func GetResourceManagementAuthorizer() (a autorest.Authorizer, err error) {
 		return armAuthorizer, nil
 	}
 
-	config := auth.NewClientCredentialsConfig(spDetails.AadClientID, spDetails.AadClientSecret, spDetails.TenantID)
-	a, err = config.Authorizer()
+	if spDetails.UseManagedIdentityExtension {
+		config := auth.NewMSIConfig()
+		a, err = config.Authorizer()
+	} else {
+		config := auth.NewClientCredentialsConfig(spDetails.AADClientID, spDetails.AADClientSecret, spDetails.TenantID)
+		a, err = config.Authorizer()
+	}
 
 	if err == nil {
 		armAuthorizer = a

@@ -773,6 +773,7 @@
     "k8s.io/client-go/tools/record",
     "k8s.io/client-go/util/retry",
     "k8s.io/client-go/util/workqueue",
+    "sigs.k8s.io/yaml",
   ]
   solver-name = "gps-cdcl"
   solver-version = 1
